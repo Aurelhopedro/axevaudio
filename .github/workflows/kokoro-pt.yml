@@ -6,11 +6,12 @@ on:
       texto_custom:
         description: |
           Texto personalizado (opcional). Se preenchido, substitui o texto padrão.
-          Podes colar aqui directamente o teu texto.
+          Podes colar aqui directamente o teu texto — mesmo que seja muito longo,
+          será dividido automaticamente em partes e cada uma gera um áudio separado.
         required: false
         default: ''
       bloco:
-        description: 'Qual bloco narrar?'
+        description: 'Qual bloco narrar? (ignorado se "texto_custom" estiver preenchido)'
         required: true
         default: 'TODOS'
         type: choice
@@ -50,6 +51,17 @@ on:
           - wav+mp3
           - wav
           - mp3
+      limite_chars:
+        description: 'Máximo de caracteres por parte (padrão: 800). Textos maiores são divididos automaticamente.'
+        required: true
+        default: '800'
+        type: choice
+        options:
+          - '400'
+          - '600'
+          - '800'
+          - '1000'
+          - '1200'
 
 # ══════════════════════════════════════════════════════════════════════
 # TEXTOS PADRÃO — HUMANIDADE E O FUTURO
@@ -106,7 +118,7 @@ jobs:
   narrar:
     name: "🎙️ Kokoro PT — ${{ github.event.inputs.voz }}"
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Verificar ambiente
@@ -144,10 +156,7 @@ jobs:
           PYEOF
 
       - name: Preparar texto para narração
-        id: texto
         run: |
-          # Se o utilizador forneceu texto custom, usa esse.
-          # Caso contrário, selecciona o bloco padrão (ou concatena todos).
           CUSTOM="${{ github.event.inputs.texto_custom }}"
           BLOCO="${{ github.event.inputs.bloco }}"
 
@@ -177,8 +186,7 @@ jobs:
           echo "=== Texto a narrar ==="
           cat narration_text.txt
           echo "======================"
-          CHARS=$(wc -c < narration_text.txt)
-          echo "Caracteres: $CHARS"
+          echo "Caracteres: $(wc -c < narration_text.txt)"
         env:
           BLOCO_1: ${{ env.BLOCO_1 }}
           BLOCO_2: ${{ env.BLOCO_2 }}
@@ -186,68 +194,202 @@ jobs:
           BLOCO_4: ${{ env.BLOCO_4 }}
           BLOCO_5: ${{ env.BLOCO_5 }}
 
-      - name: Gerar narração — Kokoro PT
+      - name: Dividir texto e gerar narração por partes
         run: |
           source venv_kokoro/bin/activate
           python - <<'PYEOF'
-          import kokoro_onnx, soundfile as sf, json, os, time, numpy as np
+          import kokoro_onnx, soundfile as sf, json, os, time, re
+          import numpy as np
 
-          VOICE = "${{ github.event.inputs.voz }}"
-          SPEED = float("${{ github.event.inputs.velocidade }}")
-          BLOCO = "${{ github.event.inputs.bloco }}"
+          VOICE       = "${{ github.event.inputs.voz }}"
+          SPEED       = float("${{ github.event.inputs.velocidade }}")
+          BLOCO       = "${{ github.event.inputs.bloco }}"
+          LIMITE      = int("${{ github.event.inputs.limite_chars }}")
+          IS_CUSTOM   = bool("${{ github.event.inputs.texto_custom }}".strip())
 
           with open("narration_text.txt", "r") as f:
             TEXT = f.read().strip()
 
-          os.makedirs("results/audio", exist_ok=True)
-          label = "custom" if "${{ github.event.inputs.texto_custom }}" else BLOCO.lower()
-          out_wav = f"results/audio/{VOICE}_{label}.wav"
+          os.makedirs("results/audio/partes", exist_ok=True)
+          label = "custom" if IS_CUSTOM else BLOCO.lower()
 
-          print(f"Voz    : {VOICE}")
-          print(f"Speed  : {SPEED}")
-          print(f"Bloco  : {label}")
-          print(f"Chars  : {len(TEXT)}")
-          print()
+          # ── Divisão inteligente por frases ──────────────────────────────
+          # Divide por pontuação final (. ! ?) respeitando abreviaturas comuns.
+          # Nunca corta a meio de uma frase.
+          def dividir_em_partes(texto, limite):
+            """
+            Divide o texto em partes de no máximo `limite` caracteres,
+            cortando sempre no fim de uma frase (. ! ? : —) ou parágrafo.
+            """
+            # Separar em frases usando pontuação final
+            frases = re.split(r'(?<=[.!?])\s+', texto)
+            partes = []
+            parte_atual = ""
 
+            for frase in frases:
+              frase = frase.strip()
+              if not frase:
+                continue
+              # Se a frase sozinha já excede o limite, subdivide por vírgulas
+              if len(frase) > limite:
+                sub_frases = re.split(r'(?<=,)\s+', frase)
+                for sub in sub_frases:
+                  if len(parte_atual) + len(sub) + 1 <= limite:
+                    parte_atual = (parte_atual + " " + sub).strip()
+                  else:
+                    if parte_atual:
+                      partes.append(parte_atual)
+                    parte_atual = sub
+              else:
+                if len(parte_atual) + len(frase) + 1 <= limite:
+                  parte_atual = (parte_atual + " " + frase).strip()
+                else:
+                  if parte_atual:
+                    partes.append(parte_atual)
+                  parte_atual = frase
+
+            if parte_atual:
+              partes.append(parte_atual)
+
+            return partes
+
+          partes = dividir_em_partes(TEXT, LIMITE)
+          total  = len(partes)
+
+          print(f"{'='*55}")
+          print(f"Voz      : {VOICE}")
+          print(f"Speed    : {SPEED}")
+          print(f"Label    : {label}")
+          print(f"Total    : {len(TEXT)} caracteres")
+          print(f"Limite   : {LIMITE} chars/parte")
+          print(f"Partes   : {total}")
+          print(f"{'='*55}\n")
+
+          # Guardar plano de divisão
+          plano = []
+          for i, p in enumerate(partes, 1):
+            plano.append({"parte": i, "chars": len(p), "preview": p[:80] + ("..." if len(p) > 80 else "")})
+            print(f"[Parte {i:02d}/{total:02d}] {len(p)} chars — {p[:60]}...")
+
+          with open("results/audio/plano_divisao.json", "w") as f:
+            json.dump({"total_partes": total, "limite_chars": LIMITE, "partes": plano},
+                      f, indent=2, ensure_ascii=False)
+
+          print(f"\n{'='*55}")
           print("A inicializar Kokoro ONNX...")
           kokoro = kokoro_onnx.Kokoro("kokoro_model/kokoro.onnx", "kokoro_model/voices.bin")
+          print("✓ Modelo carregado\n")
 
-          t0 = time.time()
-          samples, sr = kokoro.create(TEXT, voice=VOICE, speed=SPEED, lang="pt-br")
-          elapsed = time.time() - t0
-          dur = len(samples) / sr
+          # ── Gerar áudio para cada parte ──────────────────────────────────
+          meta_partes  = []
+          samples_full = []
+          sr_global    = None
+          tempo_total  = 0
 
-          sf.write(out_wav, samples, sr)
-          print(f"✓ {out_wav}")
-          print(f"  Duração : {dur:.1f}s")
-          print(f"  Geração : {elapsed:.1f}s")
+          for i, parte in enumerate(partes, 1):
+            nome_ficheiro = f"results/audio/partes/parte_{i:02d}_{label}.wav"
+            print(f"\n▶ Parte {i:02d}/{total:02d} ({len(parte)} chars)")
+            print(f"  Texto: {parte[:80]}{'...' if len(parte) > 80 else ''}")
 
-          meta = {
-            "voice": VOICE, "speed": SPEED, "bloco": label,
-            "duration_s": round(dur, 2), "generation_s": round(elapsed, 2),
-            "chars": len(TEXT), "file": out_wav, "status": "OK"
+            t0 = time.time()
+            try:
+              samples, sr = kokoro.create(parte, voice=VOICE, speed=SPEED, lang="pt-br")
+              elapsed = time.time() - t0
+              dur     = len(samples) / sr
+              tempo_total += elapsed
+
+              sf.write(nome_ficheiro, samples, sr)
+              print(f"  ✓ {nome_ficheiro} | {dur:.1f}s áudio | {elapsed:.1f}s geração")
+
+              meta_partes.append({
+                "parte": i, "chars": len(parte),
+                "file": nome_ficheiro,
+                "duration_s": round(dur, 2),
+                "generation_s": round(elapsed, 2),
+                "status": "OK"
+              })
+
+              # Acumular para o ficheiro completo
+              if sr_global is None:
+                sr_global = sr
+              # Pequena pausa de silêncio entre partes (0.4s)
+              if samples_full:
+                silencio = np.zeros(int(sr_global * 0.4), dtype=samples.dtype)
+                samples_full.append(silencio)
+              samples_full.append(samples)
+
+            except Exception as e:
+              print(f"  ✗ ERRO: {e}")
+              meta_partes.append({"parte": i, "status": "ERROR", "error": str(e)})
+
+          # ── Concatenar todas as partes num ficheiro único ────────────────
+          ok_partes = [m for m in meta_partes if m["status"] == "OK"]
+          if len(ok_partes) > 1 and samples_full and sr_global:
+            print(f"\n{'='*55}")
+            print("A concatenar todas as partes num ficheiro único...")
+            full_samples = np.concatenate(samples_full)
+            out_full     = f"results/audio/{VOICE}_{label}_completo.wav"
+            sf.write(out_full, full_samples, sr_global)
+            dur_total = len(full_samples) / sr_global
+            print(f"✓ {out_full} | {dur_total:.1f}s total")
+          elif len(ok_partes) == 1:
+            # Apenas uma parte — copia directamente como completo
+            import shutil
+            src = ok_partes[0]["file"]
+            out_full = f"results/audio/{VOICE}_{label}_completo.wav"
+            shutil.copy(src, out_full)
+            dur_total = ok_partes[0]["duration_s"]
+
+          # ── Metadata final ───────────────────────────────────────────────
+          meta_final = {
+            "voice": VOICE, "speed": SPEED, "label": label,
+            "total_chars": len(TEXT), "limite_chars": LIMITE,
+            "total_partes": total, "partes_ok": len(ok_partes),
+            "tempo_geracao_total_s": round(tempo_total, 2),
+            "ficheiro_completo": out_full if ok_partes else None,
+            "duracao_total_s": round(dur_total, 2) if ok_partes else 0,
+            "partes": meta_partes
           }
           with open("results/audio/metadata.json", "w") as f:
-            json.dump(meta, f, indent=2, ensure_ascii=False)
+            json.dump(meta_final, f, indent=2, ensure_ascii=False)
+
+          print(f"\n{'='*55}")
+          print(f"✅ Concluído!")
+          print(f"   Partes geradas : {len(ok_partes)}/{total}")
+          print(f"   Duração total  : {round(dur_total, 1) if ok_partes else 0}s")
+          print(f"   Tempo geração  : {round(tempo_total, 1)}s")
           PYEOF
 
       - name: Converter para MP3
         if: ${{ contains(github.event.inputs.formato, 'mp3') }}
         run: |
           shopt -s nullglob
-          for wav in results/audio/*.wav; do
+          echo "=== A converter WAV → MP3 ==="
+          # Partes individuais
+          for wav in results/audio/partes/*.wav; do
             ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
-            echo "✓ MP3: ${wav%.wav}.mp3"
+            echo "✓ ${wav%.wav}.mp3"
+          done
+          # Ficheiro completo
+          for wav in results/audio/*_completo.wav; do
+            ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
+            echo "✓ ${wav%.wav}.mp3"
           done
 
       - name: Remover WAV (se formato só MP3)
         if: ${{ github.event.inputs.formato == 'mp3' }}
-        run: rm -f results/audio/*.wav
-
-      - name: Mostrar resultado
         run: |
-          echo "=== Ficheiros gerados ==="
-          ls -lh results/audio/
+          rm -f results/audio/partes/*.wav
+          rm -f results/audio/*_completo.wav
+
+      - name: Mostrar resultado final
+        run: |
+          echo "=== Estrutura de ficheiros ==="
+          find results/audio -type f | sort
+          echo ""
+          echo "=== Tamanhos ==="
+          ls -lh results/audio/ 2>/dev/null || true
+          ls -lh results/audio/partes/ 2>/dev/null || true
           echo ""
           echo "=== Metadata ==="
           cat results/audio/metadata.json
@@ -256,10 +398,21 @@ jobs:
         if: always()
         run: rm -rf venv_kokoro kokoro_model
 
-      - name: Upload — Narração
+      - name: Upload — Partes individuais
         uses: actions/upload-artifact@v4
         with:
-          name: kokoro-pt-${{ github.event.inputs.voz }}-${{ github.event.inputs.bloco }}
-          path: results/audio/
+          name: kokoro-partes-${{ github.event.inputs.voz }}
+          path: results/audio/partes/
+          retention-days: 14
+          if-no-files-found: warn
+
+      - name: Upload — Áudio completo + metadata
+        uses: actions/upload-artifact@v4
+        with:
+          name: kokoro-completo-${{ github.event.inputs.voz }}
+          path: |
+            results/audio/*_completo.*
+            results/audio/metadata.json
+            results/audio/plano_divisao.json
           retention-days: 14
           if-no-files-found: error
