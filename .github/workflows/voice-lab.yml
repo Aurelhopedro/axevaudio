@@ -12,8 +12,8 @@ on:
           - ALL
           - kokoro
           - chatterbox
-          - supertonic
           - piper
+          - supertonic
       mode:
         description: 'Modo de execução'
         required: true
@@ -58,14 +58,13 @@ env:
     é também um participante na construção da sua própria história e do futuro da humanidade.
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JOB 1 — KOKORO-82M
-# Fix v3: usar python3 do sistema (3.12), instalar apenas kokoro + soundfile
-# O erro blis/spacy acontecia porque o kokoro antigo puxava spacy.
-# Solução: instalar misaki[en] separadamente para controlar dependências.
+# JOB 1 — KOKORO via ONNX
+# Fix: usar kokoro-onnx que NÃO depende de misaki/spacy/blis
+# Instala apenas: kokoro-onnx, soundfile, numpy — zero compilação C
 # ══════════════════════════════════════════════════════════════════════════════
 jobs:
   kokoro:
-    name: "🎙️ Kokoro-82M"
+    name: "🎙️ Kokoro-82M (ONNX)"
     runs-on: ubuntu-latest
     if: ${{ github.event.inputs.model == 'ALL' || github.event.inputs.model == 'kokoro' }}
     timeout-minutes: 45
@@ -73,78 +72,76 @@ jobs:
     steps:
       - name: Verificar ambiente
         run: |
-          python3 --version
-          pip3 --version
-          echo "=== RAM ===" && free -h
-          echo "=== DISCO ===" && df -h /
+          python3 --version && pip3 --version
+          free -h && df -h /
 
-      - name: Instalar dependências do sistema
+      - name: Instalar espeak-ng e ffmpeg
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq espeak-ng ffmpeg
-          espeak-ng --version
 
-      - name: Criar venv e instalar Kokoro
+      - name: Instalar kokoro-onnx (sem spacy/blis)
         run: |
           python3 -m venv venv_kokoro
           source venv_kokoro/bin/activate
           pip install --quiet --upgrade pip wheel
-          # Instalar misaki[en] antes do kokoro para evitar pull do spacy
-          pip install --quiet "misaki[en]"
-          pip install --quiet kokoro soundfile numpy
-          python -c "from kokoro import KPipeline; print('✓ Kokoro OK')"
+          # kokoro-onnx: implementação ONNX do Kokoro, sem misaki, sem spacy
+          pip install --quiet kokoro-onnx soundfile numpy
+          python -c "import kokoro_onnx; print('✓ kokoro-onnx OK')"
 
-      - name: Listar vozes pt-BR disponíveis
+      - name: Descarregar modelo e vozes pt-BR
         run: |
           source venv_kokoro/bin/activate
           python - <<'PYEOF'
-          import json, os
-          voices = {"pt-BR": [
-            {"id": "pf_dora",  "gender": "F", "grade": "A"},
-            {"id": "pm_alex",  "gender": "M", "grade": "B"},
-            {"id": "pm_santa", "gender": "M", "grade": "B"}
-          ]}
+          import urllib.request, os, zipfile
+
+          os.makedirs("kokoro_model", exist_ok=True)
           os.makedirs("results/kokoro/audition", exist_ok=True)
-          with open("results/kokoro/voices.json", "w") as f:
-            json.dump(voices, f, indent=2, ensure_ascii=False)
-          print(json.dumps(voices, indent=2))
+
+          # Modelo ONNX v1.0
+          model_url = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
+          voices_url = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
+
+          print("A descarregar modelo kokoro ONNX...")
+          urllib.request.urlretrieve(model_url, "kokoro_model/kokoro.onnx")
+          print("A descarregar vozes...")
+          urllib.request.urlretrieve(voices_url, "kokoro_model/voices.bin")
+          print("✓ Pronto")
           PYEOF
 
-      - name: Gerar amostras de audição
+      - name: Gerar amostras de audição — Kokoro
         run: |
           source venv_kokoro/bin/activate
           python - <<'PYEOF'
-          from kokoro import KPipeline
-          import soundfile as sf, numpy as np, json, os, time
+          import kokoro_onnx, soundfile as sf, json, os, time, numpy as np
 
           TEXT   = os.environ["AUDITION_TEXT"]
           VOICES = ["pf_dora", "pm_alex", "pm_santa"]
           os.makedirs("results/kokoro/audition", exist_ok=True)
-          meta = {"model": "kokoro-82m", "lang": "pt-BR", "samples": []}
+          meta = {"model": "kokoro-82m-onnx", "lang": "pt-BR", "samples": []}
 
-          print("A inicializar KPipeline pt-BR...")
-          pipe = KPipeline(lang_code='p', repo_id='hexgrad/Kokoro-82M')
+          print("A inicializar Kokoro ONNX...")
+          kokoro = kokoro_onnx.Kokoro("kokoro_model/kokoro.onnx", "kokoro_model/voices.bin")
 
           for v in VOICES:
             print(f"\n→ Voz: {v}")
             t0 = time.time()
             try:
-              chunks = [c for _, _, c in pipe(TEXT, voice=v, speed=1.0)]
-              if not chunks: raise ValueError("Sem chunks")
-              audio = np.concatenate(chunks)
-              out   = f"results/kokoro/audition/{v}.wav"
-              sf.write(out, audio, 24000)
-              dur = len(audio)/24000
-              gen = time.time()-t0
+              samples, sr = kokoro.create(TEXT, voice=v, speed=1.0, lang="pt-br")
+              out = f"results/kokoro/audition/{v}.wav"
+              sf.write(out, samples, sr)
+              dur = len(samples) / sr
+              gen = time.time() - t0
               print(f"  ✓ {out} | {dur:.1f}s áudio | {gen:.1f}s geração")
-              meta["samples"].append({"voice":v,"file":out,"duration_s":round(dur,2),"generation_s":round(gen,2),"status":"OK"})
+              meta["samples"].append({"voice": v, "file": out,
+                "duration_s": round(dur, 2), "generation_s": round(gen, 2), "status": "OK"})
             except Exception as e:
-              print(f"  ✗ {e}")
-              meta["samples"].append({"voice":v,"status":"ERROR","error":str(e)})
+              print(f"  ✗ Erro: {e}")
+              meta["samples"].append({"voice": v, "status": "ERROR", "error": str(e)})
 
-          with open("results/kokoro/metadata.json","w") as f:
+          with open("results/kokoro/metadata.json", "w") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
-          ok = sum(1 for s in meta["samples"] if s["status"]=="OK")
+          ok = sum(1 for s in meta["samples"] if s["status"] == "OK")
           print(f"\n=== Kokoro: {ok}/{len(VOICES)} vozes OK ===")
           PYEOF
         env:
@@ -162,7 +159,7 @@ jobs:
       - name: Limpar
         if: always()
         run: |
-          rm -rf venv_kokoro ~/.cache/huggingface/hub/models--hexgrad*
+          rm -rf venv_kokoro kokoro_model
           free -h && df -h /
 
       - name: Upload — Kokoro
@@ -175,7 +172,7 @@ jobs:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 2 — CHATTERBOX MULTILINGUAL
-# Fix v3: remover python3.11, usar python3 do sistema
+# Fix: corrigir script bash de verificação de RAM (awk sem aspas especiais)
 # ══════════════════════════════════════════════════════════════════════════════
   chatterbox:
     name: "🎙️ Chatterbox Multilingual"
@@ -190,7 +187,7 @@ jobs:
       - name: Verificar recursos
         run: free -h && df -h /
 
-      - name: Instalar dependências do sistema
+      - name: Instalar ffmpeg
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq ffmpeg
@@ -203,11 +200,14 @@ jobs:
           pip install --quiet chatterbox-tts soundfile numpy
           echo "✓ Chatterbox instalado"
 
-      - name: Verificar RAM
+      - name: Verificar RAM disponível
         run: |
-          A=$(free -m | awk '/^Mem:/{print $7}')
-          echo "RAM disponível: ${A} MB"
-          [ "$A" -lt 2500 ] && echo "⚠️ RAM pode ser insuficiente"
+          # Fix: awk sem aspas tipográficas
+          RAM_MB=$(free -m | awk '/Mem:/ {print $7}')
+          echo "RAM disponível: ${RAM_MB} MB"
+          if [ "${RAM_MB}" -lt 2500 ]; then
+            echo "AVISO: RAM pode ser insuficiente para Chatterbox (~3 GB necessários)"
+          fi
 
       - name: Gerar amostras de audição — Chatterbox
         run: |
@@ -217,26 +217,27 @@ jobs:
           TEXT = os.environ["AUDITION_TEXT"]
           LANG = "${{ github.event.inputs.language }}"
           os.makedirs("results/chatterbox/audition", exist_ok=True)
-          meta = {"model":"chatterbox-multilingual","lang":LANG,"samples":[]}
+          meta = {"model": "chatterbox-multilingual", "lang": LANG, "samples": []}
           try:
             import torchaudio as ta
             from chatterbox.mtl_tts import ChatterboxMultilingualTTS
-            print("A carregar Chatterbox em CPU...")
+            print("A carregar Chatterbox Multilingual em CPU...")
             t0 = time.time()
             model = ChatterboxMultilingualTTS.from_pretrained(device="cpu")
             print(f"Carregado em {time.time()-t0:.1f}s")
             t0 = time.time()
             wav = model.generate(TEXT, lang="pt", exaggeration=0.5, cfg_weight=0.5)
-            elapsed = time.time()-t0
+            elapsed = time.time() - t0
             out = f"results/chatterbox/audition/chatterbox_{LANG}.wav"
             ta.save(out, wav, model.sr)
-            dur = wav.shape[-1]/model.sr
+            dur = wav.shape[-1] / model.sr
             print(f"✓ {out} | {dur:.1f}s | {elapsed:.1f}s")
-            meta["samples"].append({"voice":f"default_{LANG}","file":out,"duration_s":round(dur,2),"generation_s":round(elapsed,2),"status":"OK"})
+            meta["samples"].append({"voice": f"default_{LANG}", "file": out,
+              "duration_s": round(dur, 2), "generation_s": round(elapsed, 2), "status": "OK"})
           except Exception as e:
             import traceback; traceback.print_exc()
-            meta["samples"].append({"status":"ERROR","error":str(e)})
-          with open("results/chatterbox/metadata.json","w") as f:
+            meta["samples"].append({"status": "ERROR", "error": str(e)})
+          with open("results/chatterbox/metadata.json", "w") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
           PYEOF
         env:
@@ -248,7 +249,7 @@ jobs:
         run: |
           shopt -s nullglob
           wavs=(results/chatterbox/audition/*.wav)
-          [ ${#wavs[@]} -eq 0 ] && echo "Sem WAV" && exit 0
+          if [ ${#wavs[@]} -eq 0 ]; then echo "Sem WAV para converter"; exit 0; fi
           for wav in "${wavs[@]}"; do
             ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
           done
@@ -268,8 +269,8 @@ jobs:
           if-no-files-found: warn
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JOB 3 — PIPER TTS (movido antes do Supertonic — mais leve e fiável)
-# Fix v3: remover python3.11, usar python3 do sistema
+# JOB 3 — PIPER TTS
+# Sem alterações — funcionou na run anterior
 # ══════════════════════════════════════════════════════════════════════════════
   piper:
     name: "🎙️ Piper TTS"
@@ -304,13 +305,13 @@ jobs:
           BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main"
           if [ "$LANG" = "pt-BR" ]; then
             NAME="pt_BR-faber-medium"
-            PATH_HF="pt/pt_BR/faber/medium/${NAME}"
+            HF_PATH="pt/pt_BR/faber/medium/${NAME}"
           else
             NAME="pt_PT-tugao-medium"
-            PATH_HF="pt/pt_PT/tugao/medium/${NAME}"
+            HF_PATH="pt/pt_PT/tugao/medium/${NAME}"
           fi
-          wget -q "${BASE}/${PATH_HF}.onnx"      -O "piper_voices/${NAME}.onnx"
-          wget -q "${BASE}/${PATH_HF}.onnx.json" -O "piper_voices/${NAME}.onnx.json"
+          wget -q "${BASE}/${HF_PATH}.onnx"      -O "piper_voices/${NAME}.onnx"
+          wget -q "${BASE}/${HF_PATH}.onnx.json" -O "piper_voices/${NAME}.onnx.json"
           echo "VOICE_FILE=piper_voices/${NAME}.onnx" >> $GITHUB_ENV
           ls -lh piper_voices/
 
@@ -324,23 +325,24 @@ jobs:
           VOICE_FILE = os.environ["VOICE_FILE"]
           LANG       = "${{ github.event.inputs.language }}"
           os.makedirs("results/piper/audition", exist_ok=True)
-          meta = {"model":"piper","lang":LANG,"samples":[]}
+          meta = {"model": "piper", "lang": LANG, "samples": []}
           try:
             print(f"A carregar: {VOICE_FILE}")
             voice = PiperVoice.load(VOICE_FILE)
             out   = f"results/piper/audition/piper_{LANG}.wav"
             t0    = time.time()
-            with wave.open(out,"w") as wf:
+            with wave.open(out, "w") as wf:
               voice.synthesize(TEXT, wf)
-            elapsed = time.time()-t0
+            elapsed = time.time() - t0
             with wave.open(out) as wf:
-              dur = wf.getnframes()/wf.getframerate()
+              dur = wf.getnframes() / wf.getframerate()
             print(f"✓ {out} | {dur:.1f}s | {elapsed:.1f}s")
-            meta["samples"].append({"voice":f"piper_{LANG}","file":out,"duration_s":round(dur,2),"generation_s":round(elapsed,2),"status":"OK"})
+            meta["samples"].append({"voice": f"piper_{LANG}", "file": out,
+              "duration_s": round(dur, 2), "generation_s": round(elapsed, 2), "status": "OK"})
           except Exception as e:
             import traceback; traceback.print_exc()
-            meta["samples"].append({"status":"ERROR","error":str(e)})
-          with open("results/piper/metadata.json","w") as f:
+            meta["samples"].append({"status": "ERROR", "error": str(e)})
+          with open("results/piper/metadata.json", "w") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
           PYEOF
         env:
@@ -369,12 +371,12 @@ jobs:
           if-no-files-found: warn
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JOB 4 — SUPERTONIC / MMS PT
-# Fix v3: remover python3.11, usar python3 do sistema
-# Usar sherpa-onnx com modelo MMS português (download integrado, sem huggingface_hub)
+# JOB 4 — MMS PT (via sherpa-onnx + wget directo)
+# Fix: download_pretrained_model não existe — usar wget com URL oficial
+# Modelo: vits-mms-por do repositório k2-fsa/sherpa-onnx no HuggingFace
 # ══════════════════════════════════════════════════════════════════════════════
   supertonic:
-    name: "🎙️ Supertonic / MMS PT"
+    name: "🎙️ MMS Português (sherpa-onnx)"
     runs-on: ubuntu-latest
     needs: piper
     if: |
@@ -399,51 +401,57 @@ jobs:
           pip install --quiet sherpa-onnx soundfile numpy
           echo "✓ sherpa-onnx instalado"
 
-      - name: Descarregar modelo MMS pt via sherpa-onnx
+      - name: Descarregar modelo MMS Português via wget
         run: |
-          source venv_supertonic/bin/activate
-          python - <<'PYEOF'
-          import sherpa_onnx, os
-          print("A descarregar modelo MMS pt...")
-          # download_pretrained_model retorna o directório do modelo
-          model_dir = sherpa_onnx.download_pretrained_model("vits-mms-por")
-          print(f"Modelo em: {model_dir}")
-          with open("model_dir.txt","w") as f: f.write(model_dir)
-          PYEOF
+          mkdir -p mms_model
+          BASE="https://huggingface.co/k2-fsa/sherpa-onnx-vits-mms-por/resolve/main"
+          echo "A descarregar modelo MMS pt..."
+          wget -q "${BASE}/model.onnx"      -O mms_model/model.onnx
+          wget -q "${BASE}/tokens.txt"      -O mms_model/tokens.txt
+          wget -q "${BASE}/lexicon.txt"     -O mms_model/lexicon.txt  || true
+          wget -q "${BASE}/date.fst"        -O mms_model/date.fst     || true
+          wget -q "${BASE}/number.fst"      -O mms_model/number.fst   || true
+          ls -lh mms_model/
 
       - name: Gerar amostras de audição — MMS PT
         run: |
           source venv_supertonic/bin/activate
           python - <<'PYEOF'
           import sherpa_onnx, soundfile as sf, json, os, time
+
           TEXT = os.environ["AUDITION_TEXT"]
           LANG = "${{ github.event.inputs.language }}"
           os.makedirs("results/supertonic/audition", exist_ok=True)
-          meta = {"model":"sherpa-mms-pt","lang":LANG,"samples":[]}
+          meta = {"model": "mms-por-sherpa-onnx", "lang": LANG, "samples": []}
+
           try:
-            with open("model_dir.txt") as f: d = f.read().strip()
-            import glob
-            onnx = glob.glob(os.path.join(d,"*.onnx"))[0]
-            tok  = os.path.join(d,"tokens.txt")
-            data = os.path.join(d,"espeak-ng-data") if os.path.isdir(os.path.join(d,"espeak-ng-data")) else ""
             tts = sherpa_onnx.OfflineTts(
               sherpa_onnx.OfflineTtsConfig(
                 model=sherpa_onnx.OfflineTtsModelConfig(
                   vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                    model=onnx, tokens=tok, data_dir=data)),
-                max_num_sentences=1))
+                    model="mms_model/model.onnx",
+                    tokens="mms_model/tokens.txt",
+                    lexicon="mms_model/lexicon.txt" if os.path.exists("mms_model/lexicon.txt") else "",
+                    data_dir="",
+                  )
+                ),
+                max_num_sentences=1,
+              )
+            )
             t0 = time.time()
             audio = tts.generate(TEXT, sid=0, speed=1.0)
-            elapsed = time.time()-t0
+            elapsed = time.time() - t0
             out = "results/supertonic/audition/mms_pt.wav"
             sf.write(out, audio.samples, audio.sample_rate)
-            dur = len(audio.samples)/audio.sample_rate
+            dur = len(audio.samples) / audio.sample_rate
             print(f"✓ {out} | {dur:.1f}s | {elapsed:.1f}s")
-            meta["samples"].append({"voice":"mms_pt","file":out,"duration_s":round(dur,2),"generation_s":round(elapsed,2),"status":"OK"})
+            meta["samples"].append({"voice": "mms_pt", "file": out,
+              "duration_s": round(dur, 2), "generation_s": round(elapsed, 2), "status": "OK"})
           except Exception as e:
             import traceback; traceback.print_exc()
-            meta["samples"].append({"status":"ERROR","error":str(e)})
-          with open("results/supertonic/metadata.json","w") as f:
+            meta["samples"].append({"status": "ERROR", "error": str(e)})
+
+          with open("results/supertonic/metadata.json", "w") as f:
             json.dump(meta, f, indent=2, ensure_ascii=False)
           PYEOF
         env:
@@ -461,10 +469,10 @@ jobs:
       - name: Limpar
         if: always()
         run: |
-          rm -rf venv_supertonic model_dir.txt
+          rm -rf venv_supertonic mms_model
           df -h /
 
-      - name: Upload — Supertonic/MMS
+      - name: Upload — MMS PT
         uses: actions/upload-artifact@v4
         with:
           name: supertonic-results
@@ -502,33 +510,36 @@ jobs:
                 f"**Modo:** ${{ github.event.inputs.mode }} | **Língua:** ${{ github.event.inputs.language }}",
                 "\n## Resultados\n",
                 "| Modelo | Estado | Vozes OK | Duração Média (s) | Geração Média (s) |",
-                "|--------|--------|:--------:|:-----------------:|:-----------------:|"]
+                "|--------|:------:|:--------:|:-----------------:|:-----------------:|"]
 
           for mf in sorted(glob.glob("all_results/*/metadata.json")):
             try:
               with open(mf) as f: meta = json.load(f)
-              name   = meta.get("model","?")
-              status = meta.get("status","OK")
-              samps  = meta.get("samples",[])
-              ok     = [s for s in samps if s.get("status")=="OK"]
+              name   = meta.get("model", "?")
+              status = meta.get("status", "OK")
+              samps  = meta.get("samples", [])
+              ok     = [s for s in samps if s.get("status") == "OK"]
               n      = len(ok)
-              avg_d  = round(sum(s.get("duration_s",0) for s in ok)/max(n,1),2)
-              avg_g  = round(sum(s.get("generation_s",0) for s in ok)/max(n,1),2)
-              icon   = "✅" if n>0 else ("⏭️" if "SKIP" in status else "❌")
+              avg_d  = round(sum(s.get("duration_s", 0) for s in ok) / max(n, 1), 2)
+              avg_g  = round(sum(s.get("generation_s", 0) for s in ok) / max(n, 1), 2)
+              icon   = "✅" if n > 0 else ("⏭️" if "SKIP" in status else "❌")
               md.append(f"| {name} | {icon} | {n} | {avg_d} | {avg_g} |")
-              report["models"].append({"model":name,"voices_ok":n,"avg_duration_s":avg_d,"avg_generation_s":avg_g})
+              report["models"].append({"model": name, "voices_ok": n,
+                "avg_duration_s": avg_d, "avg_generation_s": avg_g})
             except Exception as e:
               print(f"Erro: {e}")
 
           md += ["\n## Próximos Passos",
                  "1. Descarregar artefactos de cada modelo",
                  "2. Ouvir os ficheiros `.wav` em `audition/`",
-                 "3. Re-executar com **modo FULL** + **selected_voice** = ID da voz escolhida"]
+                 "3. Escolher a voz mais natural",
+                 "4. Re-executar com **modo FULL** + **selected_voice** = ID da voz"]
 
           os.makedirs("reports", exist_ok=True)
           txt = "\n".join(md)
-          with open("reports/comparison_report.md","w") as f: f.write(txt)
-          with open("reports/comparison.json","w") as f: json.dump(report,f,indent=2,ensure_ascii=False)
+          with open("reports/comparison_report.md", "w") as f: f.write(txt)
+          with open("reports/comparison.json", "w") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
           print(txt)
           PYEOF
 
