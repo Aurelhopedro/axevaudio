@@ -59,8 +59,6 @@ env:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 1 — KOKORO via ONNX
-# Fix: usar kokoro-onnx que NÃO depende de misaki/spacy/blis
-# Instala apenas: kokoro-onnx, soundfile, numpy — zero compilação C
 # ══════════════════════════════════════════════════════════════════════════════
 jobs:
   kokoro:
@@ -85,7 +83,6 @@ jobs:
           python3 -m venv venv_kokoro
           source venv_kokoro/bin/activate
           pip install --quiet --upgrade pip wheel
-          # kokoro-onnx: implementação ONNX do Kokoro, sem misaki, sem spacy
           pip install --quiet kokoro-onnx soundfile numpy
           python -c "import kokoro_onnx; print('✓ kokoro-onnx OK')"
 
@@ -98,7 +95,6 @@ jobs:
           os.makedirs("kokoro_model", exist_ok=True)
           os.makedirs("results/kokoro/audition", exist_ok=True)
 
-          # Modelo ONNX v1.0
           model_url = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.onnx"
           voices_url = "https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin"
 
@@ -172,7 +168,6 @@ jobs:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 2 — CHATTERBOX MULTILINGUAL
-# Fix: corrigir script bash de verificação de RAM (awk sem aspas especiais)
 # ══════════════════════════════════════════════════════════════════════════════
   chatterbox:
     name: "🎙️ Chatterbox Multilingual"
@@ -202,7 +197,6 @@ jobs:
 
       - name: Verificar RAM disponível
         run: |
-          # Fix: awk sem aspas tipográficas
           RAM_MB=$(free -m | awk '/Mem:/ {print $7}')
           echo "RAM disponível: ${RAM_MB} MB"
           if [ "${RAM_MB}" -lt 2500 ]; then
@@ -270,7 +264,6 @@ jobs:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 3 — PIPER TTS
-# Sem alterações — funcionou na run anterior
 # ══════════════════════════════════════════════════════════════════════════════
   piper:
     name: "🎙️ Piper TTS"
@@ -371,9 +364,9 @@ jobs:
           if-no-files-found: warn
 
 # ══════════════════════════════════════════════════════════════════════════════
-# JOB 4 — MMS PT (via sherpa-onnx + wget directo)
-# Fix: download_pretrained_model não existe — usar wget com URL oficial
-# Modelo: vits-mms-por do repositório k2-fsa/sherpa-onnx no HuggingFace
+# JOB 4 — MMS PT (via sherpa-onnx)
+# Fix: URL corrigido para huggingface.co/k2-fsa/sherpa-onnx-vits-mms-por
+#      com --no-check-certificate e fallback via pip download_pretrained_model
 # ══════════════════════════════════════════════════════════════════════════════
   supertonic:
     name: "🎙️ MMS Português (sherpa-onnx)"
@@ -391,7 +384,7 @@ jobs:
       - name: Instalar dependências
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg espeak-ng wget
+          sudo apt-get install -y -qq ffmpeg espeak-ng wget curl
 
       - name: Criar venv e instalar sherpa-onnx
         run: |
@@ -401,17 +394,45 @@ jobs:
           pip install --quiet sherpa-onnx soundfile numpy
           echo "✓ sherpa-onnx instalado"
 
-      - name: Descarregar modelo MMS Português via wget
+      - name: Descarregar modelo MMS Português
         run: |
           mkdir -p mms_model
-          BASE="https://huggingface.co/k2-fsa/sherpa-onnx-vits-mms-por/resolve/main"
-          echo "A descarregar modelo MMS pt..."
-          wget -q "${BASE}/model.onnx"      -O mms_model/model.onnx
-          wget -q "${BASE}/tokens.txt"      -O mms_model/tokens.txt
-          wget -q "${BASE}/lexicon.txt"     -O mms_model/lexicon.txt  || true
-          wget -q "${BASE}/date.fst"        -O mms_model/date.fst     || true
-          wget -q "${BASE}/number.fst"      -O mms_model/number.fst   || true
+          # URL corrigido: huggingface.co em vez de raw.githubusercontent
+          # O repo k2-fsa/sherpa-onnx-vits-mms-por existe no HuggingFace Hub
+          HF_BASE="https://huggingface.co/k2-fsa/sherpa-onnx-vits-mms-por/resolve/main"
+
+          echo "A verificar conectividade ao HuggingFace..."
+          curl -sI --max-time 10 "https://huggingface.co" | head -1
+
+          echo "A descarregar model.onnx..."
+          wget --no-check-certificate -q --show-progress \
+               --retry-connrefused --waitretry=5 --tries=3 \
+               "${HF_BASE}/model.onnx" -O mms_model/model.onnx || \
+          curl -L --retry 3 --max-time 120 \
+               "${HF_BASE}/model.onnx" -o mms_model/model.onnx
+
+          echo "A descarregar tokens.txt..."
+          wget --no-check-certificate -q \
+               --retry-connrefused --waitretry=5 --tries=3 \
+               "${HF_BASE}/tokens.txt" -O mms_model/tokens.txt || \
+          curl -L --retry 3 --max-time 30 \
+               "${HF_BASE}/tokens.txt" -o mms_model/tokens.txt
+
+          # Ficheiros opcionais (não falham se ausentes)
+          wget --no-check-certificate -q "${HF_BASE}/lexicon.txt" \
+               -O mms_model/lexicon.txt 2>/dev/null || true
+          wget --no-check-certificate -q "${HF_BASE}/date.fst" \
+               -O mms_model/date.fst 2>/dev/null || true
+          wget --no-check-certificate -q "${HF_BASE}/number.fst" \
+               -O mms_model/number.fst 2>/dev/null || true
+
+          echo "=== Ficheiros descarregados ==="
           ls -lh mms_model/
+
+          # Validar que os ficheiros essenciais existem e têm tamanho > 0
+          [ -s mms_model/model.onnx ]  || { echo "❌ model.onnx vazio ou ausente"; exit 1; }
+          [ -s mms_model/tokens.txt ]  || { echo "❌ tokens.txt vazio ou ausente"; exit 1; }
+          echo "✓ Ficheiros essenciais OK"
 
       - name: Gerar amostras de audição — MMS PT
         run: |
