@@ -43,23 +43,27 @@ on:
           - '1.1'
           - '1.2'
       formato:
-        description: 'Formato de saída'
+        description: 'Formato de saída (MP3 é padrão e leve; WAV é exportado em ZIP separado se activado)'
         required: true
-        default: 'wav+mp3'
+        default: 'mp3'
         type: choice
         options:
-          - wav+mp3
-          - wav
           - mp3
+          - mp3+wav
       limite_chars:
-        description: 'Máximo de caracteres por parte (padrão: 800). Textos maiores são divididos automaticamente.'
+        description: 'Máximo de caracteres por parte. Textos maiores são divididos automaticamente.'
         required: true
         default: '800'
         type: choice
         options:
+          - '200'
+          - '300'
           - '400'
+          - '500'
           - '600'
+          - '700'
           - '800'
+          - '900'
           - '1000'
           - '1200'
 
@@ -129,7 +133,7 @@ jobs:
       - name: Instalar dependências do sistema
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq espeak-ng ffmpeg
+          sudo apt-get install -y -qq espeak-ng ffmpeg zip
 
       - name: Instalar kokoro-onnx
         run: |
@@ -201,11 +205,11 @@ jobs:
           import kokoro_onnx, soundfile as sf, json, os, time, re
           import numpy as np
 
-          VOICE       = "${{ github.event.inputs.voz }}"
-          SPEED       = float("${{ github.event.inputs.velocidade }}")
-          BLOCO       = "${{ github.event.inputs.bloco }}"
-          LIMITE      = int("${{ github.event.inputs.limite_chars }}")
-          IS_CUSTOM   = bool("${{ github.event.inputs.texto_custom }}".strip())
+          VOICE     = "${{ github.event.inputs.voz }}"
+          SPEED     = float("${{ github.event.inputs.velocidade }}")
+          BLOCO     = "${{ github.event.inputs.bloco }}"
+          LIMITE    = int("${{ github.event.inputs.limite_chars }}")
+          IS_CUSTOM = bool("${{ github.event.inputs.texto_custom }}".strip())
 
           with open("narration_text.txt", "r") as f:
             TEXT = f.read().strip()
@@ -214,23 +218,14 @@ jobs:
           label = "custom" if IS_CUSTOM else BLOCO.lower()
 
           # ── Divisão inteligente por frases ──────────────────────────────
-          # Divide por pontuação final (. ! ?) respeitando abreviaturas comuns.
-          # Nunca corta a meio de uma frase.
           def dividir_em_partes(texto, limite):
-            """
-            Divide o texto em partes de no máximo `limite` caracteres,
-            cortando sempre no fim de uma frase (. ! ? : —) ou parágrafo.
-            """
-            # Separar em frases usando pontuação final
             frases = re.split(r'(?<=[.!?])\s+', texto)
             partes = []
             parte_atual = ""
-
             for frase in frases:
               frase = frase.strip()
               if not frase:
                 continue
-              # Se a frase sozinha já excede o limite, subdivide por vírgulas
               if len(frase) > limite:
                 sub_frases = re.split(r'(?<=,)\s+', frase)
                 for sub in sub_frases:
@@ -247,10 +242,8 @@ jobs:
                   if parte_atual:
                     partes.append(parte_atual)
                   parte_atual = frase
-
             if parte_atual:
               partes.append(parte_atual)
-
             return partes
 
           partes = dividir_em_partes(TEXT, LIMITE)
@@ -265,7 +258,6 @@ jobs:
           print(f"Partes   : {total}")
           print(f"{'='*55}\n")
 
-          # Guardar plano de divisão
           plano = []
           for i, p in enumerate(partes, 1):
             plano.append({"parte": i, "chars": len(p), "preview": p[:80] + ("..." if len(p) > 80 else "")})
@@ -280,16 +272,17 @@ jobs:
           kokoro = kokoro_onnx.Kokoro("kokoro_model/kokoro.onnx", "kokoro_model/voices.bin")
           print("✓ Modelo carregado\n")
 
-          # ── Gerar áudio para cada parte ──────────────────────────────────
+          # ── Gerar áudio WAV para cada parte ─────────────────────────────
           meta_partes  = []
           samples_full = []
           sr_global    = None
           tempo_total  = 0
+          dur_total    = 0
 
           for i, parte in enumerate(partes, 1):
-            nome_ficheiro = f"results/audio/partes/parte_{i:02d}_{label}.wav"
+            nome_wav = f"results/audio/partes/parte_{i:02d}_{label}.wav"
             print(f"\n▶ Parte {i:02d}/{total:02d} ({len(parte)} chars)")
-            print(f"  Texto: {parte[:80]}{'...' if len(parte) > 80 else ''}")
+            print(f"  {parte[:80]}{'...' if len(parte) > 80 else ''}")
 
             t0 = time.time()
             try:
@@ -297,22 +290,21 @@ jobs:
               elapsed = time.time() - t0
               dur     = len(samples) / sr
               tempo_total += elapsed
+              dur_total   += dur
 
-              sf.write(nome_ficheiro, samples, sr)
-              print(f"  ✓ {nome_ficheiro} | {dur:.1f}s áudio | {elapsed:.1f}s geração")
+              sf.write(nome_wav, samples, sr)
+              print(f"  ✓ {nome_wav} | {dur:.1f}s | {elapsed:.1f}s geração")
 
               meta_partes.append({
                 "parte": i, "chars": len(parte),
-                "file": nome_ficheiro,
+                "wav": nome_wav,
                 "duration_s": round(dur, 2),
                 "generation_s": round(elapsed, 2),
                 "status": "OK"
               })
 
-              # Acumular para o ficheiro completo
               if sr_global is None:
                 sr_global = sr
-              # Pequena pausa de silêncio entre partes (0.4s)
               if samples_full:
                 silencio = np.zeros(int(sr_global * 0.4), dtype=samples.dtype)
                 samples_full.append(silencio)
@@ -322,32 +314,26 @@ jobs:
               print(f"  ✗ ERRO: {e}")
               meta_partes.append({"parte": i, "status": "ERROR", "error": str(e)})
 
-          # ── Concatenar todas as partes num ficheiro único ────────────────
-          ok_partes = [m for m in meta_partes if m["status"] == "OK"]
-          if len(ok_partes) > 1 and samples_full and sr_global:
-            print(f"\n{'='*55}")
-            print("A concatenar todas as partes num ficheiro único...")
-            full_samples = np.concatenate(samples_full)
-            out_full     = f"results/audio/{VOICE}_{label}_completo.wav"
-            sf.write(out_full, full_samples, sr_global)
-            dur_total = len(full_samples) / sr_global
-            print(f"✓ {out_full} | {dur_total:.1f}s total")
-          elif len(ok_partes) == 1:
-            # Apenas uma parte — copia directamente como completo
-            import shutil
-            src = ok_partes[0]["file"]
-            out_full = f"results/audio/{VOICE}_{label}_completo.wav"
-            shutil.copy(src, out_full)
-            dur_total = ok_partes[0]["duration_s"]
+          # ── Concatenar num WAV completo ──────────────────────────────────
+          ok_partes  = [m for m in meta_partes if m["status"] == "OK"]
+          out_completo_wav = f"results/audio/{VOICE}_{label}_completo.wav"
 
-          # ── Metadata final ───────────────────────────────────────────────
+          if samples_full and sr_global:
+            print(f"\n{'='*55}")
+            print("A concatenar todas as partes...")
+            full_samples = np.concatenate(samples_full)
+            sf.write(out_completo_wav, full_samples, sr_global)
+            dur_total_real = len(full_samples) / sr_global
+            print(f"✓ {out_completo_wav} | {dur_total_real:.1f}s total")
+          else:
+            dur_total_real = 0
+
           meta_final = {
             "voice": VOICE, "speed": SPEED, "label": label,
             "total_chars": len(TEXT), "limite_chars": LIMITE,
             "total_partes": total, "partes_ok": len(ok_partes),
             "tempo_geracao_total_s": round(tempo_total, 2),
-            "ficheiro_completo": out_full if ok_partes else None,
-            "duracao_total_s": round(dur_total, 2) if ok_partes else 0,
+            "duracao_total_s": round(dur_total_real, 2),
             "partes": meta_partes
           }
           with open("results/audio/metadata.json", "w") as f:
@@ -355,32 +341,48 @@ jobs:
 
           print(f"\n{'='*55}")
           print(f"✅ Concluído!")
-          print(f"   Partes geradas : {len(ok_partes)}/{total}")
-          print(f"   Duração total  : {round(dur_total, 1) if ok_partes else 0}s")
+          print(f"   Partes OK      : {len(ok_partes)}/{total}")
+          print(f"   Duração total  : {round(dur_total_real, 1)}s")
           print(f"   Tempo geração  : {round(tempo_total, 1)}s")
           PYEOF
 
-      - name: Converter para MP3
-        if: ${{ contains(github.event.inputs.formato, 'mp3') }}
+      # ── Converter SEMPRE para MP3 (padrão obrigatório) ───────────────────
+      - name: Converter WAV → MP3 (partes)
         run: |
           shopt -s nullglob
-          echo "=== A converter WAV → MP3 ==="
-          # Partes individuais
+          echo "=== A converter partes WAV → MP3 ==="
           for wav in results/audio/partes/*.wav; do
             ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
             echo "✓ ${wav%.wav}.mp3"
           done
-          # Ficheiro completo
+
+      - name: Converter WAV → MP3 (ficheiro completo)
+        run: |
+          shopt -s nullglob
+          echo "=== A converter completo WAV → MP3 ==="
           for wav in results/audio/*_completo.wav; do
             ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
             echo "✓ ${wav%.wav}.mp3"
           done
 
-      - name: Remover WAV (se formato só MP3)
-        if: ${{ github.event.inputs.formato == 'mp3' }}
+      # ── ZIP dos WAV (apenas se mp3+wav) ─────────────────────────────────
+      - name: Empacotar WAV em ZIP separado
+        if: ${{ github.event.inputs.formato == 'mp3+wav' }}
+        run: |
+          echo "=== A criar ZIP com ficheiros WAV ==="
+          cd results/audio
+          zip -j "wav_partes_${{ github.event.inputs.voz }}.zip" partes/*.wav
+          zip -j "wav_completo_${{ github.event.inputs.voz }}.zip" *_completo.wav
+          cd ../..
+          echo "✓ ZIPs criados:"
+          ls -lh results/audio/*.zip
+
+      # ── Remover WAV soltos (ficam apenas MP3 + ZIP se pedido) ───────────
+      - name: Remover ficheiros WAV soltos
         run: |
           rm -f results/audio/partes/*.wav
           rm -f results/audio/*_completo.wav
+          echo "✓ WAV removidos — apenas MP3 (+ ZIP se mp3+wav)"
 
       - name: Mostrar resultado final
         run: |
@@ -398,21 +400,33 @@ jobs:
         if: always()
         run: rm -rf venv_kokoro kokoro_model
 
-      - name: Upload — Partes individuais
+      # ── Upload MP3 — partes individuais ─────────────────────────────────
+      - name: Upload — Partes MP3
         uses: actions/upload-artifact@v4
         with:
-          name: kokoro-partes-${{ github.event.inputs.voz }}
-          path: results/audio/partes/
+          name: kokoro-partes-mp3-${{ github.event.inputs.voz }}
+          path: results/audio/partes/*.mp3
           retention-days: 14
           if-no-files-found: warn
 
-      - name: Upload — Áudio completo + metadata
+      # ── Upload MP3 — ficheiro completo + metadata ────────────────────────
+      - name: Upload — Completo MP3 + Metadata
         uses: actions/upload-artifact@v4
         with:
-          name: kokoro-completo-${{ github.event.inputs.voz }}
+          name: kokoro-completo-mp3-${{ github.event.inputs.voz }}
           path: |
-            results/audio/*_completo.*
+            results/audio/*_completo.mp3
             results/audio/metadata.json
             results/audio/plano_divisao.json
           retention-days: 14
           if-no-files-found: error
+
+      # ── Upload ZIP dos WAV (apenas se mp3+wav) ───────────────────────────
+      - name: Upload — WAV em ZIP (opcional)
+        if: ${{ github.event.inputs.formato == 'mp3+wav' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kokoro-wav-zip-${{ github.event.inputs.voz }}
+          path: results/audio/*.zip
+          retention-days: 7
+          if-no-files-found: warn
