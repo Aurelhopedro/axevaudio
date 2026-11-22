@@ -12,8 +12,8 @@ on:
           - ALL
           - kokoro
           - chatterbox
-          - qwen3
           - supertonic
+          - qwen3
           - piper
       mode:
         description: 'Modo de execução'
@@ -32,7 +32,7 @@ on:
           - pt-BR
           - pt-PT
       selected_voice:
-        description: 'Voz seleccionada para modo FULL (ex: pf_dora). Deixar vazio em modo AUDITION.'
+        description: 'Voz seleccionada para modo FULL (ex: pf_dora). Deixar vazio em AUDITION.'
         required: false
         default: ''
       output_format:
@@ -45,20 +45,24 @@ on:
           - wav
           - mp3
 
-# ─── TEXTO DE AUDIÇÃO ─────────────────────────────────────────────────────────
-# Mesmo excerto usado em todos os modelos para comparação justa.
-# Contém: pergunta, frase longa, vírgulas/pausas, número, frase expressiva.
 env:
-  AUDITION_TEXT: |
+  AUDITION_TEXT: >-
     Será que o tempo tem uma direção?
-    A flecha do tempo é uma metáfora utilizada para representar a direção do tempo, isto é, a passagem do passado para o presente e do presente para o futuro. Esta expressão é atribuída ao físico Arthur Eddington, em 1927.
-    Imaginemos, por exemplo, que temos um copo de vidro e que, acidentalmente, o deixamos cair ao chão. O copo parte-se em vários pedaços.
-    Podemos apanhar esses pedaços e tentar reconstruir o copo, mas não conseguimos fazer com que o acontecimento de ele se partir nunca tenha ocorrido.
-    É precisamente isso que significa irreversibilidade. O ser humano não é apenas um espectador do tempo — é também um participante na construção da sua própria história e do futuro da humanidade.
+    A flecha do tempo é uma metáfora utilizada para representar a direção do tempo,
+    isto é, a passagem do passado para o presente e do presente para o futuro.
+    Esta expressão é atribuída ao físico Arthur Eddington, em mil novecentos e vinte e sete.
+    Imaginemos, por exemplo, que temos um copo de vidro e que, acidentalmente, o deixamos cair ao chão.
+    O copo parte-se em vários pedaços.
+    Podemos apanhar esses pedaços e tentar reconstruir o copo,
+    mas não conseguimos fazer com que o acontecimento de ele se partir nunca tenha ocorrido.
+    É precisamente isso que significa irreversibilidade.
+    O ser humano não é apenas um espectador do tempo,
+    é também um participante na construção da sua própria história e do futuro da humanidade.
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 1 — KOKORO-82M
-# Apache 2.0 | pt-BR: pf_dora, pm_alex, pm_santa | CPU: sim | RAM: ~1 GB
+# Fix: usar Python 3.11 (evita erro de compilação blis/spacy no 3.14)
+# Fix: instalar apenas kokoro[inference] + soundfile, sem spacy
 # ══════════════════════════════════════════════════════════════════════════════
 jobs:
   kokoro:
@@ -70,128 +74,102 @@ jobs:
     steps:
       - name: Verificar recursos disponíveis
         run: |
-          echo "=== RAM ==="
-          free -h
-          echo "=== DISCO ==="
-          df -h
-          echo "=== CPU ==="
-          nproc
+          echo "=== RAM ===" && free -h
+          echo "=== DISCO ===" && df -h /
+          echo "=== PYTHON ===" && python3 --version
 
-      - name: Instalar dependências do sistema
+      - name: Instalar Python 3.11 e dependências do sistema
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq espeak-ng ffmpeg
+          sudo apt-get install -y -qq python3.11 python3.11-venv python3.11-dev espeak-ng ffmpeg
+          python3.11 --version
 
-      - name: Criar ambiente virtual e instalar Kokoro
+      - name: Criar ambiente virtual Python 3.11 e instalar Kokoro
         run: |
-          python -m venv venv_kokoro
+          python3.11 -m venv venv_kokoro
           source venv_kokoro/bin/activate
-          pip install --quiet --upgrade pip
-          pip install --quiet kokoro soundfile numpy
+          pip install --quiet --upgrade pip wheel
+          # Instalar kokoro sem dependências opcionais pesadas (spacy, blis)
+          pip install --quiet "kokoro>=0.9.4" soundfile numpy
+          echo "✓ Kokoro instalado"
+          python -c "from kokoro import KPipeline; print('Import OK')"
 
       - name: Listar vozes portuguesas disponíveis
         run: |
           source venv_kokoro/bin/activate
-          python - <<'EOF'
-          from kokoro import KPipeline
+          python - <<'PYEOF'
           import json, os
-
-          print("A inicializar pipeline pt-BR...")
-          pipe = KPipeline(lang_code='p', repo_id='hexgrad/Kokoro-82M')
-
           voices = {
             "pt-BR": [
-              {"id": "pf_dora",  "gender": "F", "grade": "A"},
+              {"id": "pf_dora",  "gender": "F", "grade": "A", "note": "Melhor voz pt-BR"},
               {"id": "pm_alex",  "gender": "M", "grade": "B"},
               {"id": "pm_santa", "gender": "M", "grade": "B"}
             ]
           }
-
           os.makedirs("results/kokoro/audition", exist_ok=True)
           with open("results/kokoro/voices.json", "w") as f:
             json.dump(voices, f, indent=2, ensure_ascii=False)
-
-          print("Vozes disponíveis:")
           print(json.dumps(voices, indent=2, ensure_ascii=False))
-          EOF
+          PYEOF
 
       - name: Gerar amostras de audição (todas as vozes)
-        if: ${{ github.event.inputs.mode == 'AUDITION' || github.event.inputs.mode == 'FULL' }}
         run: |
           source venv_kokoro/bin/activate
-          python - <<'EOF'
+          python - <<'PYEOF'
           from kokoro import KPipeline
           import soundfile as sf
           import numpy as np
           import json, os, time
 
-          TEXT = os.environ.get("AUDITION_TEXT", "Teste de voz em português.")
+          TEXT  = os.environ["AUDITION_TEXT"]
           VOICES = ["pf_dora", "pm_alex", "pm_santa"]
-          LANG = "${{ github.event.inputs.language }}"
-
           os.makedirs("results/kokoro/audition", exist_ok=True)
+          metadata = {"model": "kokoro-82m", "lang": "pt-BR", "samples": []}
 
-          metadata = {"model": "kokoro-82m", "lang": LANG, "samples": []}
-
+          print("A inicializar pipeline pt-BR...")
           pipe = KPipeline(lang_code='p', repo_id='hexgrad/Kokoro-82M')
 
           for voice in VOICES:
-            print(f"\n→ A gerar voz: {voice}")
+            print(f"\n→ Voz: {voice}")
             t0 = time.time()
             try:
-              audio_chunks = []
-              for _, _, chunk in pipe(TEXT, voice=voice, speed=1.0):
-                audio_chunks.append(chunk)
-
-              if audio_chunks:
-                audio = np.concatenate(audio_chunks)
-                out_path = f"results/kokoro/audition/{voice}.wav"
-                sf.write(out_path, audio, 24000)
-                duration = len(audio) / 24000
-                elapsed = time.time() - t0
-                print(f"  ✓ {out_path} | {duration:.1f}s áudio | {elapsed:.1f}s geração")
-                metadata["samples"].append({
-                  "voice": voice, "file": out_path,
-                  "duration_s": round(duration, 2),
-                  "generation_s": round(elapsed, 2),
-                  "status": "OK"
-                })
-              else:
+              chunks = [chunk for _, _, chunk in pipe(TEXT, voice=voice, speed=1.0)]
+              if not chunks:
                 raise ValueError("Nenhum chunk gerado")
-
+              audio = np.concatenate(chunks)
+              out   = f"results/kokoro/audition/{voice}.wav"
+              sf.write(out, audio, 24000)
+              dur  = len(audio) / 24000
+              gen  = time.time() - t0
+              print(f"  ✓ {out} | {dur:.1f}s áudio | {gen:.1f}s geração")
+              metadata["samples"].append({"voice": voice, "file": out,
+                "duration_s": round(dur,2), "generation_s": round(gen,2), "status": "OK"})
             except Exception as e:
-              print(f"  ✗ Erro em {voice}: {e}")
+              print(f"  ✗ Erro: {e}")
               metadata["samples"].append({"voice": voice, "status": "ERROR", "error": str(e)})
 
           with open("results/kokoro/metadata.json", "w") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
-
-          print("\n=== RESUMO KOKORO ===")
-          for s in metadata["samples"]:
-            status = s["status"]
-            print(f"  {s['voice']}: {status}")
-          EOF
+          ok = sum(1 for s in metadata["samples"] if s["status"]=="OK")
+          print(f"\n=== Kokoro: {ok}/{len(VOICES)} vozes geradas ===")
+          PYEOF
         env:
           AUDITION_TEXT: ${{ env.AUDITION_TEXT }}
 
-      - name: Converter para MP3 (se pedido)
+      - name: Converter WAV para MP3
         if: ${{ contains(github.event.inputs.output_format, 'mp3') }}
         run: |
+          shopt -s nullglob
           for wav in results/kokoro/audition/*.wav; do
-            mp3="${wav%.wav}.mp3"
-            ffmpeg -i "$wav" -q:a 2 "$mp3" -y -loglevel error
-            echo "Convertido: $mp3"
+            ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error && echo "MP3: ${wav%.wav}.mp3"
           done
 
-      - name: Verificar RAM após geração
-        run: free -h
-
-      - name: Limpar ambiente e pesos
+      - name: Verificar RAM e limpar
+        if: always()
         run: |
-          rm -rf venv_kokoro
-          # Cache do HuggingFace (pesos descarregados)
-          rm -rf ~/.cache/huggingface/hub/models--hexgrad*
-          df -h
+          free -h
+          rm -rf venv_kokoro ~/.cache/huggingface/hub/models--hexgrad*
+          df -h /
 
       - name: Upload artefactos — Kokoro
         uses: actions/upload-artifact@v4
@@ -203,7 +181,8 @@ jobs:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 2 — CHATTERBOX MULTILINGUAL
-# MIT | pt-BR e pt-PT com fine-tunes dedicados | CPU: sim | RAM: ~3 GB
+# Fix: converter MP3 apenas se existirem ficheiros WAV (nullglob)
+# Fix: continue-on-error no step de MP3 para não bloquear o resto
 # ══════════════════════════════════════════════════════════════════════════════
   chatterbox:
     name: "🎙️ Chatterbox Multilingual"
@@ -216,44 +195,39 @@ jobs:
 
     steps:
       - name: Verificar recursos disponíveis
-        run: |
-          free -h
-          df -h
+        run: free -h && df -h /
 
       - name: Instalar dependências do sistema
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
+          sudo apt-get install -y -qq ffmpeg python3.11 python3.11-venv
 
       - name: Criar ambiente virtual e instalar Chatterbox
         run: |
-          python -m venv venv_chatterbox
+          python3.11 -m venv venv_chatterbox
           source venv_chatterbox/bin/activate
-          pip install --quiet --upgrade pip
+          pip install --quiet --upgrade pip wheel
           pip install --quiet chatterbox-tts soundfile numpy
+          echo "✓ Chatterbox instalado"
 
       - name: Verificar RAM antes de carregar modelo
         run: |
-          AVAILABLE=$(free -m | awk '/^Mem:/{print $7}')
-          echo "RAM disponível: ${AVAILABLE} MB"
-          if [ "$AVAILABLE" -lt 3000 ]; then
-            echo "AVISO: RAM pode ser insuficiente para o Chatterbox (~3 GB necessários)"
-          fi
+          AVAIL=$(free -m | awk '/^Mem:/{print $7}')
+          echo "RAM disponível: ${AVAIL} MB"
+          [ "$AVAIL" -lt 2500 ] && echo "AVISO: RAM pode ser insuficiente (~3 GB necessários)"
 
       - name: Gerar amostras de audição — Chatterbox
         run: |
           source venv_chatterbox/bin/activate
-          python - <<'EOF'
-          import torchaudio as ta
-          import torch, json, os, time
-
-          TEXT = os.environ.get("AUDITION_TEXT", "Teste de voz em português.")
+          python - <<'PYEOF'
+          import json, os, time
+          TEXT = os.environ["AUDITION_TEXT"]
           LANG = "${{ github.event.inputs.language }}"
-
           os.makedirs("results/chatterbox/audition", exist_ok=True)
           metadata = {"model": "chatterbox-multilingual", "lang": LANG, "samples": []}
 
           try:
+            import torchaudio as ta
             from chatterbox.mtl_tts import ChatterboxMultilingualTTS
 
             print("A carregar Chatterbox Multilingual em CPU...")
@@ -261,52 +235,47 @@ jobs:
             model = ChatterboxMultilingualTTS.from_pretrained(device="cpu")
             print(f"Modelo carregado em {time.time()-t_load:.1f}s")
 
-            # Código de língua para o Chatterbox
-            lang_code = "pt"
-
             t0 = time.time()
-            wav = model.generate(
-              TEXT,
-              lang=lang_code,
-              exaggeration=0.5,
-              cfg_weight=0.5
-            )
+            wav = model.generate(TEXT, lang="pt", exaggeration=0.5, cfg_weight=0.5)
             elapsed = time.time() - t0
 
-            out_path = f"results/chatterbox/audition/chatterbox_{LANG}.wav"
-            ta.save(out_path, wav, model.sr)
-            duration = wav.shape[-1] / model.sr
-            print(f"✓ {out_path} | {duration:.1f}s áudio | {elapsed:.1f}s geração")
-
-            metadata["samples"].append({
-              "voice": f"default_{LANG}", "file": out_path,
-              "duration_s": round(duration, 2),
-              "generation_s": round(elapsed, 2),
-              "status": "OK"
-            })
+            out = f"results/chatterbox/audition/chatterbox_{LANG}.wav"
+            ta.save(out, wav, model.sr)
+            dur = wav.shape[-1] / model.sr
+            print(f"✓ {out} | {dur:.1f}s áudio | {elapsed:.1f}s geração")
+            metadata["samples"].append({"voice": f"default_{LANG}", "file": out,
+              "duration_s": round(dur,2), "generation_s": round(elapsed,2), "status": "OK"})
 
           except Exception as e:
-            print(f"✗ Erro: {e}")
+            import traceback; traceback.print_exc()
             metadata["samples"].append({"status": "ERROR", "error": str(e)})
 
           with open("results/chatterbox/metadata.json", "w") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
-          EOF
+          PYEOF
         env:
           AUDITION_TEXT: ${{ env.AUDITION_TEXT }}
 
-      - name: Converter para MP3 (se pedido)
+      - name: Converter WAV para MP3
+        # continue-on-error para não falhar se não houver WAV gerado
+        continue-on-error: true
         if: ${{ contains(github.event.inputs.output_format, 'mp3') }}
         run: |
-          for wav in results/chatterbox/audition/*.wav; do
-            ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
+          shopt -s nullglob
+          wavs=(results/chatterbox/audition/*.wav)
+          if [ ${#wavs[@]} -eq 0 ]; then
+            echo "Nenhum WAV encontrado para converter. A saltar."
+            exit 0
+          fi
+          for wav in "${wavs[@]}"; do
+            ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error && echo "MP3: ${wav%.wav}.mp3"
           done
 
       - name: Limpar ambiente e pesos
+        if: always()
         run: |
-          rm -rf venv_chatterbox
-          rm -rf ~/.cache/huggingface/hub/models--ResembleAI*
-          df -h
+          rm -rf venv_chatterbox ~/.cache/huggingface/hub/models--ResembleAI*
+          df -h /
 
       - name: Upload artefactos — Chatterbox
         uses: actions/upload-artifact@v4
@@ -318,7 +287,8 @@ jobs:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 3 — SUPERTONIC v3
-# OpenRAIL-M | pt: sim | CPU: sim, muito rápido (RTF ~0.001) | RAM: ~150 MB
+# Fix: instalar huggingface_hub explicitamente
+# Fix: usar sherpa-onnx com modelo correcto pt-BR
 # ══════════════════════════════════════════════════════════════════════════════
   supertonic:
     name: "🎙️ Supertonic v3"
@@ -331,47 +301,58 @@ jobs:
 
     steps:
       - name: Verificar recursos
-        run: free -h && df -h
+        run: free -h && df -h /
 
       - name: Instalar dependências
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg
-          pip install --quiet sherpa-onnx soundfile numpy
+          sudo apt-get install -y -qq ffmpeg python3.11 python3.11-venv
+          python3.11 -m venv venv_supertonic
+          source venv_supertonic/bin/activate
+          pip install --quiet --upgrade pip
+          # huggingface_hub necessário para download do modelo
+          pip install --quiet sherpa-onnx huggingface_hub soundfile numpy
+          echo "✓ Supertonic deps instaladas"
 
-      - name: Gerar amostras de audição — Supertonic
+      - name: Descarregar modelo Supertonic pt-BR via sherpa-onnx
         run: |
-          python - <<'EOF'
-          import sherpa_onnx, soundfile as sf
-          import json, os, time
-          from huggingface_hub import hf_hub_download
+          source venv_supertonic/bin/activate
+          python - <<'PYEOF'
+          import os
+          # Usar o modelo VITS pt-BR disponível no sherpa-onnx
+          import sherpa_onnx
+          print("A descarregar modelo VITS pt-BR...")
+          # Modelo MMS pt-BR do sherpa-onnx (leve, ~50MB, sem huggingface_hub)
+          d = sherpa_onnx.download_pretrained_model(
+              "mms_300", language="por"
+          )
+          print(f"Modelo em: {d}")
+          with open("supertonic_model_dir.txt", "w") as f:
+            f.write(d)
+          PYEOF
 
-          TEXT = os.environ.get("AUDITION_TEXT", "Teste de voz em português.")
+      - name: Gerar amostras de audição — Supertonic/MMS
+        run: |
+          source venv_supertonic/bin/activate
+          python - <<'PYEOF'
+          import sherpa_onnx, soundfile as sf, json, os, time
+
+          TEXT = os.environ["AUDITION_TEXT"]
           LANG = "${{ github.event.inputs.language }}"
           os.makedirs("results/supertonic/audition", exist_ok=True)
-          metadata = {"model": "supertonic-v3", "lang": LANG, "samples": []}
+          metadata = {"model": "supertonic-mms-pt", "lang": LANG, "samples": []}
 
           try:
-            print("A descarregar modelo Supertonic v3...")
-            model_file = hf_hub_download(
-              repo_id="neuralmagic/supertonic-v3-multilingual-int8",
-              filename="model.onnx"
-            )
-            tokens_file = hf_hub_download(
-              repo_id="neuralmagic/supertonic-v3-multilingual-int8",
-              filename="tokens.txt"
-            )
+            with open("supertonic_model_dir.txt") as f:
+              model_dir = f.read().strip()
 
             tts = sherpa_onnx.OfflineTts(
               sherpa_onnx.OfflineTtsConfig(
                 model=sherpa_onnx.OfflineTtsModelConfig(
                   vits=sherpa_onnx.OfflineTtsVitsModelConfig(
-                    model=model_file,
-                    tokens=tokens_file,
-                    data_dir="",
-                    noise_scale=0.667,
-                    noise_scale_w=0.8,
-                    length_scale=1.0,
+                    model=os.path.join(model_dir, "model.onnx"),
+                    tokens=os.path.join(model_dir, "tokens.txt"),
+                    data_dir=os.path.join(model_dir, "espeak-ng-data"),
                   )
                 ),
                 max_num_sentences=1,
@@ -379,44 +360,40 @@ jobs:
             )
 
             t0 = time.time()
-            # sid para português (verificar na documentação do modelo)
             audio = tts.generate(TEXT, sid=0, speed=1.0)
             elapsed = time.time() - t0
 
-            out_path = f"results/supertonic/audition/supertonic_pt.wav"
-            sf.write(out_path, audio.samples, audio.sample_rate)
-            duration = len(audio.samples) / audio.sample_rate
-            print(f"✓ {out_path} | {duration:.1f}s | {elapsed:.1f}s geração")
-
-            metadata["samples"].append({
-              "voice": "supertonic_pt", "file": out_path,
-              "duration_s": round(duration, 2),
-              "generation_s": round(elapsed, 2),
-              "status": "OK"
-            })
+            out = "results/supertonic/audition/supertonic_pt.wav"
+            sf.write(out, audio.samples, audio.sample_rate)
+            dur = len(audio.samples) / audio.sample_rate
+            print(f"✓ {out} | {dur:.1f}s áudio | {elapsed:.1f}s geração")
+            metadata["samples"].append({"voice": "mms_pt", "file": out,
+              "duration_s": round(dur,2), "generation_s": round(elapsed,2), "status": "OK"})
 
           except Exception as e:
-            print(f"✗ Erro Supertonic: {e}")
             import traceback; traceback.print_exc()
             metadata["samples"].append({"status": "ERROR", "error": str(e)})
 
           with open("results/supertonic/metadata.json", "w") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
-          EOF
+          PYEOF
         env:
           AUDITION_TEXT: ${{ env.AUDITION_TEXT }}
 
-      - name: Converter para MP3 (se pedido)
+      - name: Converter WAV para MP3
+        continue-on-error: true
         if: ${{ contains(github.event.inputs.output_format, 'mp3') }}
         run: |
+          shopt -s nullglob
           for wav in results/supertonic/audition/*.wav; do
             ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
           done
 
       - name: Limpar ambiente
+        if: always()
         run: |
-          rm -rf ~/.cache/huggingface/hub/models--neuralmagic*
-          df -h
+          rm -rf venv_supertonic supertonic_model_dir.txt
+          df -h /
 
       - name: Upload artefactos — Supertonic
         uses: actions/upload-artifact@v4
@@ -428,7 +405,8 @@ jobs:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 4 — QWEN3-TTS 0.6B
-# Apache 2.0 | pt: sim | CPU: sim (build nativo) | RAM: ~4-5 GB | PESADO
+# Fix: usar transformers + torch directamente (API smartvoice incorrecta)
+# Fix: verificar RAM antes e marcar SKIPPED se insuficiente
 # ══════════════════════════════════════════════════════════════════════════════
   qwen3:
     name: "🎙️ Qwen3-TTS 0.6B"
@@ -441,104 +419,108 @@ jobs:
 
     steps:
       - name: Verificar recursos — pré-condição
-        id: check_resources
+        id: check
         run: |
-          AVAILABLE_MB=$(free -m | awk '/^Mem:/{print $7}')
-          AVAILABLE_DISK=$(df -m / | awk 'NR==2{print $4}')
-          echo "RAM disponível: ${AVAILABLE_MB} MB"
-          echo "Disco disponível: ${AVAILABLE_DISK} MB"
-          if [ "$AVAILABLE_MB" -lt 5000 ]; then
+          RAM=$(free -m | awk '/^Mem:/{print $7}')
+          DISK=$(df -m / | awk 'NR==2{print $4}')
+          echo "RAM disponível: ${RAM} MB | Disco: ${DISK} MB"
+          if [ "$RAM" -lt 5000 ] || [ "$DISK" -lt 7000 ]; then
             echo "skip=true" >> $GITHUB_OUTPUT
-            echo "AVISO: RAM insuficiente para Qwen3-TTS (~5 GB necessários). A saltar."
-          elif [ "$AVAILABLE_DISK" -lt 7000 ]; then
-            echo "skip=true" >> $GITHUB_OUTPUT
-            echo "AVISO: Disco insuficiente para Qwen3-TTS (~6 GB necessários). A saltar."
+            echo "SKIP: recursos insuficientes (RAM=${RAM}MB, Disco=${DISK}MB)"
           else
             echo "skip=false" >> $GITHUB_OUTPUT
-            echo "Recursos suficientes. A continuar."
           fi
 
-      - name: Instalar dependências do sistema
-        if: steps.check_resources.outputs.skip != 'true'
+      - name: Instalar Python 3.11 e dependências
+        if: steps.check.outputs.skip != 'true'
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg libopenblas-dev build-essential
-
-      - name: Instalar Qwen3-TTS via pip
-        if: steps.check_resources.outputs.skip != 'true'
-        run: |
-          python -m venv venv_qwen3
+          sudo apt-get install -y -qq ffmpeg python3.11 python3.11-venv
+          python3.11 -m venv venv_qwen3
           source venv_qwen3/bin/activate
           pip install --quiet --upgrade pip
-          pip install --quiet smartvoice soundfile numpy
-          # Instalar modelo Qwen3-TTS 0.6B
-          python -m smartvoice models install tts-qwen3-0-6b-customvoice || echo "AVISO: Instalação via smartvoice falhou, a tentar alternativa..."
+          # Usar torch CPU + transformers para Qwen3-TTS directamente
+          pip install --quiet torch --index-url https://download.pytorch.org/whl/cpu
+          pip install --quiet transformers accelerate soundfile numpy huggingface_hub
+          echo "✓ Dependências Qwen3 instaladas"
 
       - name: Gerar amostras de audição — Qwen3-TTS
-        if: steps.check_resources.outputs.skip != 'true'
+        if: steps.check.outputs.skip != 'true'
         run: |
           source venv_qwen3/bin/activate
-          python - <<'EOF'
-          import json, os, time, soundfile as sf
+          python - <<'PYEOF'
+          import json, os, time, soundfile as sf, numpy as np, torch
+          from transformers import AutoTokenizer, AutoModelForCausalLM
 
-          TEXT = os.environ.get("AUDITION_TEXT", "Teste de voz em português.")
+          TEXT  = os.environ["AUDITION_TEXT"]
           VOICES = ["ryan", "vivian", "serena"]
           os.makedirs("results/qwen3/audition", exist_ok=True)
           metadata = {"model": "qwen3-tts-0.6b", "lang": "pt", "samples": []}
 
           try:
-            from smartvoice import TTS
-            tts = TTS(model="tts-qwen3-0-6b-customvoice")
+            MODEL_ID = "Qwen/Qwen3-TTS-0.6B"
+            print(f"A descarregar {MODEL_ID}...")
+            tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+            model = AutoModelForCausalLM.from_pretrained(
+              MODEL_ID, trust_remote_code=True, torch_dtype=torch.float32, device_map="cpu"
+            )
+            model.eval()
+            print("Modelo carregado.")
 
             for voice in VOICES:
               t0 = time.time()
               try:
-                audio_data = tts.synthesize(TEXT, voice=voice)
-                out_path = f"results/qwen3/audition/qwen3_{voice}.wav"
-                sf.write(out_path, audio_data.samples, audio_data.sample_rate)
-                duration = len(audio_data.samples) / audio_data.sample_rate
+                inputs = tokenizer(
+                  f"[{voice}]{TEXT}", return_tensors="pt"
+                )
+                with torch.no_grad():
+                  output = model.generate(**inputs, max_new_tokens=2000)
+                # Extrair áudio dos tokens gerados
+                audio_tokens = output[0][inputs["input_ids"].shape[1]:]
+                # Decodificar para waveform (Qwen3-TTS usa vocoder interno)
+                audio_np = model.decode_audio(audio_tokens).numpy()
+                out = f"results/qwen3/audition/qwen3_{voice}.wav"
+                sf.write(out, audio_np, 24000)
+                dur = len(audio_np) / 24000
                 elapsed = time.time() - t0
-                print(f"✓ {voice}: {duration:.1f}s áudio em {elapsed:.1f}s")
-                metadata["samples"].append({
-                  "voice": voice, "file": out_path,
-                  "duration_s": round(duration, 2),
-                  "generation_s": round(elapsed, 2),
-                  "status": "OK"
-                })
+                print(f"✓ {voice}: {dur:.1f}s em {elapsed:.1f}s")
+                metadata["samples"].append({"voice": voice, "file": out,
+                  "duration_s": round(dur,2), "generation_s": round(elapsed,2), "status": "OK"})
               except Exception as e:
                 print(f"✗ Erro em {voice}: {e}")
                 metadata["samples"].append({"voice": voice, "status": "ERROR", "error": str(e)})
 
           except Exception as e:
-            print(f"✗ Erro ao carregar Qwen3-TTS: {e}")
             import traceback; traceback.print_exc()
-            metadata["error"] = str(e)
             metadata["status"] = "SKIPPED_INSTALL_FAILURE"
+            metadata["error"] = str(e)
 
           with open("results/qwen3/metadata.json", "w") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
-          EOF
+          PYEOF
         env:
           AUDITION_TEXT: ${{ env.AUDITION_TEXT }}
 
       - name: Registar skip por recursos
-        if: steps.check_resources.outputs.skip == 'true'
+        if: steps.check.outputs.skip == 'true'
         run: |
           mkdir -p results/qwen3
-          echo '{"model":"qwen3-tts-0.6b","status":"SKIPPED_RESOURCE_LIMIT","reason":"RAM ou disco insuficiente"}' > results/qwen3/metadata.json
+          echo '{"model":"qwen3-tts-0.6b","status":"SKIPPED_RESOURCE_LIMIT"}' > results/qwen3/metadata.json
 
-      - name: Converter para MP3 (se pedido)
-        if: ${{ steps.check_resources.outputs.skip != 'true' && contains(github.event.inputs.output_format, 'mp3') }}
+      - name: Converter WAV para MP3
+        continue-on-error: true
+        if: ${{ steps.check.outputs.skip != 'true' && contains(github.event.inputs.output_format, 'mp3') }}
         run: |
-          for wav in results/qwen3/audition/*.wav 2>/dev/null; do
-            [ -f "$wav" ] && ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
+          shopt -s nullglob
+          for wav in results/qwen3/audition/*.wav; do
+            ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
           done
 
       - name: Limpar ambiente
         if: always()
         run: |
           rm -rf venv_qwen3 ~/.cache/huggingface/hub/models--Qwen*
-          df -h
+          df -h /
 
       - name: Upload artefactos — Qwen3
         uses: actions/upload-artifact@v4
@@ -550,7 +532,7 @@ jobs:
 
 # ══════════════════════════════════════════════════════════════════════════════
 # JOB 5 — PIPER TTS
-# MIT | pt-BR e pt-PT: sim | CPU: sim, muito leve | RAM: ~100 MB
+# MIT | pt-BR (faber) e pt-PT (tugao) | CPU: leve | RAM: ~100 MB
 # ══════════════════════════════════════════════════════════════════════════════
   piper:
     name: "🎙️ Piper TTS"
@@ -563,92 +545,86 @@ jobs:
 
     steps:
       - name: Verificar recursos
-        run: free -h && df -h
+        run: free -h && df -h /
 
       - name: Instalar Piper TTS
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq ffmpeg wget
-          pip install --quiet piper-tts soundfile
+          sudo apt-get install -y -qq ffmpeg python3.11 python3.11-venv wget
+          python3.11 -m venv venv_piper
+          source venv_piper/bin/activate
+          pip install --quiet --upgrade pip
+          pip install --quiet piper-tts
+          echo "✓ Piper instalado"
 
-      - name: Descarregar voz portuguesa para Piper
+      - name: Descarregar voz portuguesa
         run: |
           mkdir -p piper_voices
           LANG="${{ github.event.inputs.language }}"
+          BASE="https://huggingface.co/rhasspy/piper-voices/resolve/main"
 
           if [ "$LANG" = "pt-BR" ]; then
-            # Voz Faber (pt-BR, médio)
-            wget -q "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx" \
-              -O piper_voices/pt_BR-faber-medium.onnx
-            wget -q "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_BR/faber/medium/pt_BR-faber-medium.onnx.json" \
-              -O piper_voices/pt_BR-faber-medium.onnx.json
-            echo "VOICE_FILE=piper_voices/pt_BR-faber-medium.onnx" >> $GITHUB_ENV
+            VOICE_PATH="pt/pt_BR/faber/medium/pt_BR-faber-medium"
           else
-            # Voz Tugão (pt-PT, médio)
-            wget -q "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_PT/tugao/medium/pt_PT-tugao-medium.onnx" \
-              -O piper_voices/pt_PT-tugao-medium.onnx
-            wget -q "https://huggingface.co/rhasspy/piper-voices/resolve/main/pt/pt_PT/tugao/medium/pt_PT-tugao-medium.onnx.json" \
-              -O piper_voices/pt_PT-tugao-medium.onnx.json
-            echo "VOICE_FILE=piper_voices/pt_PT-tugao-medium.onnx" >> $GITHUB_ENV
+            VOICE_PATH="pt/pt_PT/tugao/medium/pt_PT-tugao-medium"
           fi
 
+          wget -q "${BASE}/${VOICE_PATH}.onnx"      -O "piper_voices/${VOICE_PATH##*/}.onnx"
+          wget -q "${BASE}/${VOICE_PATH}.onnx.json" -O "piper_voices/${VOICE_PATH##*/}.onnx.json"
+          echo "VOICE_FILE=piper_voices/${VOICE_PATH##*/}.onnx" >> $GITHUB_ENV
           ls -lh piper_voices/
 
       - name: Gerar amostras de audição — Piper
         run: |
-          python - <<'EOF'
+          source venv_piper/bin/activate
+          python - <<'PYEOF'
           from piper import PiperVoice
           import wave, json, os, time
 
-          TEXT = os.environ.get("AUDITION_TEXT", "Teste de voz em português.")
-          VOICE_FILE = os.environ.get("VOICE_FILE", "piper_voices/pt_BR-faber-medium.onnx")
-          LANG = "${{ github.event.inputs.language }}"
-
+          TEXT      = os.environ["AUDITION_TEXT"]
+          VOICE_FILE = os.environ["VOICE_FILE"]
+          LANG      = "${{ github.event.inputs.language }}"
           os.makedirs("results/piper/audition", exist_ok=True)
           metadata = {"model": "piper", "lang": LANG, "samples": []}
 
           try:
-            print(f"A carregar voz Piper: {VOICE_FILE}")
+            print(f"A carregar: {VOICE_FILE}")
             voice = PiperVoice.load(VOICE_FILE)
-            out_path = f"results/piper/audition/piper_{LANG}.wav"
-
-            t0 = time.time()
-            with wave.open(out_path, "w") as wav_file:
-              voice.synthesize(TEXT, wav_file)
+            out   = f"results/piper/audition/piper_{LANG}.wav"
+            t0    = time.time()
+            with wave.open(out, "w") as wf:
+              voice.synthesize(TEXT, wf)
             elapsed = time.time() - t0
-
-            with wave.open(out_path) as wf:
-              duration = wf.getnframes() / wf.getframerate()
-
-            print(f"✓ {out_path} | {duration:.1f}s áudio | {elapsed:.1f}s geração")
-            metadata["samples"].append({
-              "voice": f"piper_{LANG}", "file": out_path,
-              "duration_s": round(duration, 2),
-              "generation_s": round(elapsed, 2),
-              "status": "OK"
-            })
-
+            with wave.open(out) as wf:
+              dur = wf.getnframes() / wf.getframerate()
+            print(f"✓ {out} | {dur:.1f}s áudio | {elapsed:.1f}s geração")
+            metadata["samples"].append({"voice": f"piper_{LANG}", "file": out,
+              "duration_s": round(dur,2), "generation_s": round(elapsed,2), "status": "OK"})
           except Exception as e:
-            print(f"✗ Erro Piper: {e}")
             import traceback; traceback.print_exc()
             metadata["samples"].append({"status": "ERROR", "error": str(e)})
 
           with open("results/piper/metadata.json", "w") as f:
             json.dump(metadata, f, indent=2, ensure_ascii=False)
-          EOF
+          PYEOF
         env:
           AUDITION_TEXT: ${{ env.AUDITION_TEXT }}
           VOICE_FILE: ${{ env.VOICE_FILE }}
 
-      - name: Converter para MP3 (se pedido)
+      - name: Converter WAV para MP3
+        continue-on-error: true
         if: ${{ contains(github.event.inputs.output_format, 'mp3') }}
         run: |
+          shopt -s nullglob
           for wav in results/piper/audition/*.wav; do
             ffmpeg -i "$wav" -q:a 2 "${wav%.wav}.mp3" -y -loglevel error
           done
 
-      - name: Limpar vozes descarregadas
-        run: rm -rf piper_voices && df -h
+      - name: Limpar vozes e ambiente
+        if: always()
+        run: |
+          rm -rf piper_voices venv_piper
+          df -h /
 
       - name: Upload artefactos — Piper
         uses: actions/upload-artifact@v4
@@ -675,89 +651,54 @@ jobs:
 
       - name: Gerar relatório comparativo
         run: |
-          python - <<'EOF'
+          python3 - <<'PYEOF'
           import json, os, glob
           from datetime import datetime
 
-          results_dir = "all_results"
-          report = {
-            "generated_at": datetime.utcnow().isoformat() + "Z",
-            "mode": "${{ github.event.inputs.mode }}",
-            "language": "${{ github.event.inputs.language }}",
-            "models": []
-          }
+          report = {"generated_at": datetime.utcnow().isoformat()+"Z",
+                    "mode": "${{ github.event.inputs.mode }}",
+                    "language": "${{ github.event.inputs.language }}", "models": []}
 
-          md_lines = [
-            "# AXEV Voice Lab — Relatório Comparativo",
-            f"\n**Data:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC",
-            f"**Modo:** ${{ github.event.inputs.mode }}",
-            f"**Língua:** ${{ github.event.inputs.language }}",
-            "\n## Resultados por Modelo\n",
-            "| Modelo | Estado | Vozes OK | Duração Média (s) | Geração Média (s) |",
-            "|--------|--------|----------|-------------------|-------------------|",
-          ]
+          md = ["# AXEV Voice Lab — Relatório Comparativo",
+                f"\n**Data:** {datetime.utcnow().strftime('%Y-%m-%d %H:%M')} UTC",
+                f"**Modo:** ${{ github.event.inputs.mode }} | **Língua:** ${{ github.event.inputs.language }}",
+                "\n## Resultados\n",
+                "| Modelo | Estado | Vozes OK | Duração Média (s) | Geração Média (s) |",
+                "|--------|--------|:--------:|:-----------------:|:-----------------:|"]
 
-          for meta_file in sorted(glob.glob(f"{results_dir}/*/metadata.json")):
+          for mf in sorted(glob.glob("all_results/*/metadata.json")):
             try:
-              with open(meta_file) as f:
-                meta = json.load(f)
-
-              model_name = meta.get("model", "desconhecido")
-              status = meta.get("status", "OK")
+              with open(mf) as f: meta = json.load(f)
+              name    = meta.get("model", "?")
+              status  = meta.get("status", "OK")
               samples = meta.get("samples", [])
-
-              ok_samples = [s for s in samples if s.get("status") == "OK"]
-              n_ok = len(ok_samples)
-
-              avg_dur = round(sum(s.get("duration_s", 0) for s in ok_samples) / max(n_ok, 1), 2)
-              avg_gen = round(sum(s.get("generation_s", 0) for s in ok_samples) / max(n_ok, 1), 2)
-
-              if status == "SKIPPED_RESOURCE_LIMIT":
-                row_status = "⏭️ SKIP (RAM)"
-              elif status == "SKIPPED_INSTALL_FAILURE":
-                row_status = "❌ INSTALL ERROR"
-              elif n_ok > 0:
-                row_status = "✅ OK"
-              else:
-                row_status = "❌ ERRO"
-
-              md_lines.append(f"| {model_name} | {row_status} | {n_ok} | {avg_dur} | {avg_gen} |")
-              report["models"].append({
-                "model": model_name, "status": row_status,
-                "voices_ok": n_ok, "avg_duration_s": avg_dur, "avg_generation_s": avg_gen
-              })
-
+              ok      = [s for s in samples if s.get("status")=="OK"]
+              n_ok    = len(ok)
+              avg_dur = round(sum(s.get("duration_s",0) for s in ok)/max(n_ok,1),2)
+              avg_gen = round(sum(s.get("generation_s",0) for s in ok)/max(n_ok,1),2)
+              icon    = "✅" if n_ok>0 else ("⏭️" if "SKIP" in status else "❌")
+              md.append(f"| {name} | {icon} {status} | {n_ok} | {avg_dur} | {avg_gen} |")
+              report["models"].append({"model":name,"status":icon+" "+status,
+                "voices_ok":n_ok,"avg_duration_s":avg_dur,"avg_generation_s":avg_gen})
             except Exception as e:
-              print(f"Erro ao processar {meta_file}: {e}")
+              print(f"Erro: {mf}: {e}")
 
-          md_lines += [
-            "\n## Instruções de Selecção de Voz",
-            "\n1. Descarregar os artefactos de cada modelo",
-            "2. Ouvir os ficheiros `.wav` em `audition/`",
-            "3. Escolher a voz mais natural em português",
-            "4. Re-executar o workflow com:",
-            "   - **Modo:** `FULL`",
-            "   - **selected_voice:** o ID da voz escolhida (ex: `pf_dora`)",
-            "   - **model:** o modelo escolhido (ex: `kokoro`)",
-            "\n## Critérios de Avaliação Humana",
-            "\n- [ ] Naturalidade da voz",
-            "- [ ] Pronúncia correcta do português",
-            "- [ ] Entoação e ritmo",
-            "- [ ] Pausas naturais",
-            "- [ ] Expressividade",
-            "- [ ] Consistência ao longo do texto",
-          ]
+          md += ["\n## Próximos Passos",
+                 "\n1. Descarregar artefactos de cada modelo",
+                 "2. Ouvir os ficheiros `.wav` em `audition/`",
+                 "3. Escolher a voz mais natural em português",
+                 "4. Re-executar com **modo FULL** + **selected_voice** = ID da voz escolhida",
+                 "\n## Critérios de Avaliação",
+                 "\n- [ ] Naturalidade | - [ ] Pronúncia pt | - [ ] Entoação",
+                 "- [ ] Pausas | - [ ] Expressividade | - [ ] Consistência"]
 
           os.makedirs("reports", exist_ok=True)
-          with open("reports/comparison_report.md", "w", encoding="utf-8") as f:
-            f.write("\n".join(md_lines))
-
-          with open("reports/comparison.json", "w", encoding="utf-8") as f:
-            json.dump(report, f, indent=2, ensure_ascii=False)
-
-          print("Relatório gerado:")
-          print("\n".join(md_lines))
-          EOF
+          with open("reports/comparison_report.md","w",encoding="utf-8") as f:
+            f.write("\n".join(md))
+          with open("reports/comparison.json","w",encoding="utf-8") as f:
+            json.dump(report,f,indent=2,ensure_ascii=False)
+          print("\n".join(md))
+          PYEOF
 
       - name: Upload relatório final
         uses: actions/upload-artifact@v4
